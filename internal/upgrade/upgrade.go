@@ -253,6 +253,20 @@ func (m *Manager) HasActiveJob(deviceID string) bool {
 	return ok
 }
 
+// ActiveCountByUpgrade 统计某次发布下当前处于在途状态的任务数。
+// 用于按发布维度限流：只数在途，不含已终态任务。
+func (m *Manager) ActiveCountByUpgrade(upgradeID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, jobID := range m.activeDevice {
+		if j, ok := m.jobs[jobID]; ok && j.UpgradeID == upgradeID {
+			n++
+		}
+	}
+	return n
+}
+
 // ActiveJob 取设备当前在途任务副本。
 func (m *Manager) ActiveJob(deviceID string) (*Job, bool) {
 	m.mu.Lock()
