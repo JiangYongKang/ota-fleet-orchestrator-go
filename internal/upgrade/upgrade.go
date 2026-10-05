@@ -275,6 +275,19 @@ func (m *Manager) Get(jobID string) (*Job, bool) {
 	return ptrJob(j.clone()), true
 }
 
+// ActiveCount 返回某次发布当前仍在途（未终态）的任务数，用于灰度整体并发上限。
+func (m *Manager) ActiveCount(upgradeID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, id := range m.activeDevice {
+		if j, ok := m.jobs[id]; ok && j.UpgradeID == upgradeID {
+			n++
+		}
+	}
+	return n
+}
+
 // JobsByUpgrade 返回某次发布下全部任务副本（按设备 ID 排序，便于逐设备定位）。
 func (m *Manager) JobsByUpgrade(upgradeID string) []*Job {
 	m.mu.Lock()

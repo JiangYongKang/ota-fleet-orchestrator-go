@@ -17,6 +17,11 @@ import (
 	"github.com/highcumontoa/ota-fleet-orchestrator-go/internal/version"
 )
 
+const (
+	hbTimeout   = 30 * time.Second
+	stepTimeout = 10 * time.Second
+)
+
 func main() {
 	start := time.Date(2026, 9, 24, 10, 0, 0, 0, time.UTC)
 	clk := clock.NewFakeClock(start)
@@ -25,9 +30,6 @@ func main() {
 	defer os.RemoveAll(dir)
 	st, err := store.NewJSONStore(filepath.Join(dir, "state.json"))
 	must(err)
-
-	const hbTimeout = 30 * time.Second
-	const stepTimeout = 10 * time.Second
 
 	reg := device.NewRegistry(hbTimeout)
 	mgr := upgrade.NewManager(stepTimeout)
@@ -117,7 +119,100 @@ func main() {
 		fmt.Printf("    恢复后 dev-B 当前版本=%s 期望存在=%v（失败后 desired 已撤回）\n", d.CurrentVer, d.HasDesired)
 	}
 	fmt.Printf("    持久化文件：%s\n", filepath.Join(dir, "state.json"))
+
+	// ---- 新能力演示：整体并发上限 / 分组暂停恢复 / 路径逐跳 ----
+	demoConcurrencyAndPause(clk)
+	demoUpgradePath(clk)
 	fmt.Println("演示完成。")
+}
+
+// demoConcurrencyAndPause 演示同一条任务整体并发上限与分组暂停/恢复。
+func demoConcurrencyAndPause(clk *clock.FakeClock) {
+	fmt.Println("== 9) 新能力：整体并发上限 cap=2 + 暂停/恢复（独立存储，互不影响）==")
+	dir, err := os.MkdirTemp("", "ota-cap-")
+	must(err)
+	defer os.RemoveAll(dir)
+	st, err := store.NewJSONStore(filepath.Join(dir, "state.json"))
+	must(err)
+	reg := device.NewRegistry(hbTimeout)
+	mgr := upgrade.NewManager(stepTimeout)
+	rb := func(j *upgrade.Job, at time.Time) error { return nil }
+	o := orchestrator.New(reg, mgr, clk, st, rb)
+	for _, id := range []string{"c1", "c2", "c3", "c4"} {
+		_, _, err := reg.Register(device.RegisterRequest{DeviceID: id, Group: "g-cap", Version: version.Version{Major: 2, Minor: 0, Patch: 0}}, clk.Now())
+		must(err)
+	}
+	pol := orchestrator.BatchPolicy{
+		Group: "g-cap", ToVersion: version.Version{Major: 2, Minor: 1, Patch: 0},
+		Rule: version.NextMinorAllowed, BatchSizes: []int{4},
+		StepTimeout: stepTimeout, MaxConcurrent: 2,
+	}
+	rollout, err := o.StartRollout(pol)
+	must(err)
+	fmt.Println("    -- 首拍：只有 c1/c2 在途，c3/c4 排队 --")
+	lgs2, err2 := o.Advance(rollout.ID)
+	printLogs(lgs2, err2)
+
+	fmt.Println("    -- 暂停 g-cap：c1/c2 在途自然收尾，空槽不补位 --")
+	_, pls := o.PauseGroup("g-cap")
+	for _, l := range pls {
+		fmt.Println("   ", l)
+	}
+	for _, id := range []string{"c1", "c2"} {
+		res := o.Report(upgrade.Report{DeviceID: id, UpgradeID: rollout.ID, Seq: 1, Success: true, At: clk.Now()})
+		fmt.Printf("    %s 成功（暂停期间）=> %s\n", id, res.Job.Phase)
+	}
+	lgs2, err2 = o.Advance(rollout.ID)
+	printLogs(lgs2, err2)
+
+	fmt.Println("    -- 恢复：c1/c2 不重派，c3/c4 立即补位 --")
+	_, rls := o.ResumeGroup("g-cap")
+	for _, l := range rls {
+		fmt.Println("   ", l)
+	}
+	for _, id := range []string{"c3", "c4"} {
+		o.Report(upgrade.Report{DeviceID: id, UpgradeID: rollout.ID, Seq: 1, Success: true, At: clk.Now()})
+	}
+	printStats(mgr, rollout.ID)
+}
+
+// demoUpgradePath 演示跨版本设备按既定路径逐跳升级。
+func demoUpgradePath(clk *clock.FakeClock) {
+	fmt.Println("== 10) 新能力：升级路径 1.0.0 -> 1.1.0 -> 1.2.0（落后两跳自动拆步）==")
+	dir, err := os.MkdirTemp("", "ota-path-")
+	must(err)
+	defer os.RemoveAll(dir)
+	st, err := store.NewJSONStore(filepath.Join(dir, "state.json"))
+	must(err)
+	reg := device.NewRegistry(hbTimeout)
+	mgr := upgrade.NewManager(stepTimeout)
+	o := orchestrator.New(reg, mgr, clk, st, func(j *upgrade.Job, at time.Time) error { return nil })
+	_, _, err = reg.Register(device.RegisterRequest{DeviceID: "p1", Group: "g-path", Version: version.Version{Major: 1}}, clk.Now())
+	must(err)
+
+	path, err := version.ParsePath([]string{"1.0.0", "1.1.0", "1.2.0"})
+	must(err)
+	rollout, err := o.StartRollout(orchestrator.BatchPolicy{
+		Group: "g-path", ToVersion: version.Version{Major: 1, Minor: 2, Patch: 0},
+		Path: path, BatchSizes: []int{1}, StepTimeout: stepTimeout,
+	})
+	must(err)
+	for hop := 0; hop < 2; hop++ {
+		lgs2, err2 := o.Advance(rollout.ID)
+		printLogs(lgs2, err2)
+		res := o.Report(upgrade.Report{DeviceID: "p1", UpgradeID: rollout.ID, Seq: int64(hop + 1), Success: true, At: clk.Now()})
+		d, _ := reg.Get("p1")
+		fmt.Printf("    第 %d 跳完成 => job 终态=%s 设备当前=%s\n", hop+1, res.Job.Phase, d.CurrentVer)
+	}
+	printStats(mgr, rollout.ID)
+
+	// 路径之外的版本组合必须被明确拒绝。
+	if _, err := o.StartRollout(orchestrator.BatchPolicy{
+		Group: "g-path", ToVersion: version.Version{Major: 1, Minor: 1, Patch: 0},
+		Path: path, BatchSizes: []int{1}, StepTimeout: stepTimeout,
+	}); err != nil {
+		fmt.Printf("    目标非路径终点被拒绝：%v\n", err)
+	}
 }
 
 func printLogs(logs []string, err error) {

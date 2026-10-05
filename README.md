@@ -7,13 +7,14 @@
 ```
 internal/
   clock/         时钟抽象：RealClock（墙钟）与 FakeClock（测试可控，可快进超时）
-  version/       版本解析、确定序比较、升级合法性规则
+  version/       版本解析、确定序比较、升级合法性规则、既定升级路径（Path）
   device/        设备注册、心跳、设备影子（desired / reported）、离线判定
-  upgrade/       单设备升级任务生命周期、结果幂等去重、超时收敛
-  orchestrator/  按组分批灰度、推进、回滚编排、重启恢复
+  upgrade/       单设备升级任务生命周期、结果幂等去重、超时收敛、按发布在途计数
+  orchestrator/  按组分批灰度、整体并发上限、分组暂停/恢复、路径逐跳、回滚、重启恢复
   store/         JSON 文件原子持久化（写临时文件后 rename）
-cmd/demo/        本地端到端演示
-*_test.go        乱序心跳、重复上报、并发下发、超时回滚、重启恢复等测试
+cmd/demo/        本地端到端演示（含新能力三段演示）
+*_test.go        乱序心跳、重复上报、并发下发、超时回滚、重启恢复、
+                 并发上限/补位、暂停恢复、路径跨版本等测试
 ```
 
 ## 2. 状态模型
@@ -88,7 +89,48 @@ DISPATCHED ──进展──> DOWNLOADING ──进展──> INSTALLING
   - 已记录 `JobID` 的设备即使在“未完成批次”中也只会被跳过，不会二次下发；
   - rollout 序号从快照恢复，新发布 ID 不复用。
 
-## 5. 本地验证方法
+## 5. 编队增强能力
+
+### 5.1 任务级整体并发上限（`BatchPolicy.MaxConcurrent`）
+
+- 按**升级任务（rollout）**配置同一条任务内最多允许多少台设备同时在升级（在途 job 数）；`0` 表示不限制（默认行为与旧版本一致）。
+- 到达上限后，当前批次中后续可派发设备进入**排队**（日志可见 `queue ... waiting for a slot`），不占用任何槽位。
+- **及时补位**：一旦有设备成功、失败或超时退出在途状态（槽位释放），`Report`/`Tick` 内部立即再跑一拍推进，排队设备在**同一个调用内**补进来，不需要等待外部下一次 `Advance`；外部重复调用 `Advance` 同样安全（幂等、可并发）。
+- **不被个例拖慢**：某台设备长时间停留在 DOWNLOADING/INSTALLING 只占 1 个槽，其余设备继续使用剩余槽位推进；超时后该槽才按既有规则收敛回滚。
+- 离线设备不占槽；恢复上线后的下一拍自动补发。判定顺序固定（批次内按设备 ID），因此补位对象确定、可复现。
+
+### 5.2 分组暂停 / 恢复（`PauseGroup` / `ResumeGroup`）
+
+- 以**设备分组**为粒度：暂停后该分组下所有未结束发布**不再派发新升级**；已在途设备按当前状态自然收尾（成功/失败/超时均正常处理）。
+- 暂停期间即使有槽位空出也**不会补位**；`IsGroupPaused` 可查询，暂停集合随快照持久化，**重启后仍然冻结**。
+- **其它分组不受影响**：不同分组的 rollout 各自推进，互不拖慢（设备级在途互斥仍由 `Manager.activeDevice` 全局保证）。
+- **恢复语义**：
+  - 恢复时立即补派一拍，无需再手工 `Advance`；
+  - 已升级成功的设备**不会重复下发、不会从头再走**（普通模式按“该设备已有终态 job”跳过；路径模式见下节）；
+  - 暂停/恢复均为幂等操作，重复调用给出明确判定说明。
+
+### 5.3 既定路径的跨版本逐步升级（`BatchPolicy.Path`）
+
+机群中常有设备落后多个版本。`Path` 是一条**严格单调向前**的版本序列（如 `1.0.0 -> 1.1.0 -> 1.2.0 -> 2.0.0`）：
+
+- `version.NewPath` / `version.ParsePath` 在构造时校验：至少两个版本、相邻版本严格向前（拒绝相等与回退）。
+- 创建发布时：
+  - `ToVersion` 必须等于路径**终点**；
+  - 组内每台设备的当前版本必须在路径上且落后于终点；**路径之外的版本组合、任何降级都被逐台列出并整单拒绝**；
+  - 设置 `Path` 后按路径规则判定，忽略普通的 `Rule`（普通单跳发布行为不变）。
+- 推进时为每台设备计算“当前版本的下一跳”，只派发**相邻一跳**的 job：
+  - 落后两跳的设备先后产生两个 job（`1.0.0->1.1.0`，成功后影子前进，再 `1.1.0->1.2.0`）；落后一跳的设备只产生一个 job；
+  - 每跳成功才更新设备 `CurrentVer` 与 reported 影子，因此已完成跳**不会重走**。
+- **中途失败/超时不重来**：
+  - 单跳设备上报失败或单步超时回滚后，设备版本停在该跳起点；下一拍**重试同一跳**，而不是跳过或从头再来，更不会把已升好的版本降回去（超时回滚的目标就是**本跳起点**）；
+  - 每跳重试上限 `BatchPolicy.MaxAttempts`（`0` 用默认值 `DefaultMaxAttempts=3`），耗尽后该设备所在批次明确熔断、发布结束并撤回 desired，避免无限重派；
+  - 路径模式下单跳失败/超时时 desired（最终目标）保留以便重试；发布因重试耗尽而终止时才撤回。
+- **重启续跑**：进度以设备 `CurrentVer` 与历史 job 共同表达并随快照持久化；恢复后从“当前版本的下一跳”继续，已完成跳不重复下发。
+- 路径与分批灰度、并发上限、暂停/恢复可叠加使用：批次仍按 canary 门控逐批开放，批内设备沿各自路径独立推进。
+
+> 兼容范围：`version.Version` 的 JSON 持久化改为字符串形式（`"1.2.3"`），同时兼容旧快照中的 `{major,minor,patch}` 对象；`BatchPolicy` 新增字段均为可选（零值即旧行为），老状态文件可直接 `Restore()`。
+
+## 6. 本地验证方法
 
 要求 Go 1.25+（仅标准库，无第三方依赖）。
 
@@ -115,12 +157,28 @@ go run ./cmd/demo
 | `orchestrator.TestTimeoutTriggersRollbackAndHaltsCanary` | 超时→回滚→批次失败→熔断后续批次 |
 | `orchestrator.TestRestartRecoversAndDoesNotDuplicate` | 重启恢复在途任务，已完成设备不重复下发 |
 | `orchestrator.TestConcurrentAdvance` | 8 个并发 Advance，每设备恰好一个任务 |
+| `version.TestPath*` | 路径构造校验、下一跳/相邻跳判定、路径外组合与降级拒绝、JSON 往返 |
+| `orchestrator.TestMaxConcurrentCapQueueAndRefill` | cap 上限内排队、完成即同拍补位、最终不重不漏 |
+| `orchestrator.TestStuckDeviceDoesNotStallOthers` | 单台卡住只占一槽，其余设备持续推进不被堵死 |
+| `orchestrator.TestPauseOneGroupDoesNotBlockOtherGroup` | 暂停 g1 不影响 g2；恢复立即补派 |
+| `orchestrator.TestPauseResumeInFlightCompletesAndNoDuplicate` | 暂停期间在途自然收尾；恢复后成功设备不重派 |
+| `orchestrator.TestPauseStatePersistsAcrossRestart` | 暂停集合随快照持久化，重启后仍冻结 |
+| `orchestrator.TestPathRolloutStepByStep` | 落后不同版本设备各按路径逐跳，自动进入下一跳 |
+| `orchestrator.TestPathRolloutRejectsOffPath` | 路径外当前版本、目标非终点整单拒绝并逐台说明 |
+| `orchestrator.TestPathHopFailureRetriesSameHop` | 中途失败重试同一跳，已完成跳不重走、版本不回退 |
+| `orchestrator.TestPathHopExhaustsAttemptsHalts` | 重试次数耗尽熔断，禁止无限重派 |
+| `orchestrator.TestPathRestartContinuesMidPath` | 路径走到一半重启，接着下一跳继续、不降级 |
+| `orchestrator.TestPathTimeoutRollsBackHopAndRetries` | 中途超时回滚到本跳起点并重试，已完成版本保留 |
+| `orchestrator.TestPathConcurrentAdvanceAndPauseRace` | 路径模式并发 Advance/Pause/Resume，cap 与在途互斥不破（-race） |
+| `orchestrator.TestCapWithPauseDrainsAndResumesQueue` | cap 与暂停叠加：放空不补位，恢复后按队列继续 |
 | `store.TestSaveLoadRoundTrip` | JSON 原子写：往返一致、无 .tmp 残留 |
 
-所有测试使用固定基准时间（`2026-09-24T10:00:00Z`）与 `FakeClock`，不依赖墙钟与外部服务，可重复运行。
+所有测试使用固定基准时间（`2026-09-24T10:00:00Z`）与 `FakeClock`，不依赖墙钟与外部服务，可重复运行。`-v` 输出中每类用例都以 `INPUT ...` / `[advance|tick|pause|resume] ...` 形式打印业务输入与判定依据（cap 计数、排队原因、路径跳变、暂停冻结等）。
 
-## 6. 设计取舍说明
+## 7. 设计取舍说明
 
 - 心跳序号与升级上报序号是**两条独立序列**：心跳乱序由 `Registry` 保护；升级结果的一次性由 `Manager` 的 `ResultReportedYet` 保证，二者不互相干扰。
 - 超时以“**每次进展刷新的单步截止时间**”而非“下发总时长”计算，更贴近真实下载/安装分阶段场景。
+- 并发上限按**单条 rollout 的在途 job 数**计数（`Manager.ActiveCount`），补位在持锁区内同拍完成，避免多个调用方之间的超发竞态；全局设备槽位仍由 `activeDevice` 单跳互斥兜底。
+- 路径进度**只以设备当前版本为锚点**（`Path.NextStep(CurrentVer)`），不额外维护“第几步”游标：失败/重启后从当前版本重新推导下一跳，天然保证不重走、不降级；每跳以独立 job 记录，逐跳可定位、可审计。
 - 持久化采用每次变更后整体快照（模拟规模小、可读性高、易于验证）；生产化时可替换为 WAL/数据库，只需实现 `orchestrator.Persist` 接口。

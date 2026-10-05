@@ -1,6 +1,7 @@
 package version
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -44,6 +45,35 @@ func Parse(s string) (Version, error) {
 // String 返回规范字符串。
 func (v Version) String() string {
 	return fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Patch)
+}
+
+// MarshalJSON 以 "major.minor.patch" 字符串落盘，状态快照与路径配置均可读。
+func (v Version) MarshalJSON() ([]byte, error) {
+	return json.Marshal(v.String())
+}
+
+// UnmarshalJSON 同时接受 "1.2.3" 字符串与旧的 {"major":1,...} 对象，
+// 保证升级前写入的历史快照仍可恢复。
+func (v *Version) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		parsed, perr := Parse(s)
+		if perr != nil {
+			return perr
+		}
+		*v = parsed
+		return nil
+	}
+	var obj struct {
+		Major int `json:"Major"`
+		Minor int `json:"Minor"`
+		Patch int `json:"Patch"`
+	}
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return fmt.Errorf("invalid version json %s: must be \"major.minor.patch\" or {major,minor,patch}", string(b))
+	}
+	*v = Version{Major: obj.Major, Minor: obj.Minor, Patch: obj.Patch}
+	return nil
 }
 
 // Compare 返回 -1/0/1，分别表示 v < o、v == o、v > o。
@@ -117,3 +147,7 @@ func CheckUpgrade(from, to Version, rule CompatibilityRule) error {
 	}
 	return nil
 }
+
+// jsonMarshal / jsonUnmarshal 供 path.go 复用，保持 encoding/json 只在一处导入。
+func jsonMarshal(v any) ([]byte, error)   { return json.Marshal(v) }
+func jsonUnmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }
